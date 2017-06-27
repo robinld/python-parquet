@@ -12,6 +12,7 @@ typedef struct {
     PyObject_HEAD
     std::unique_ptr<parquet::ParquetFileReader> file;
     std::vector<std::tuple<std::string, std::shared_ptr<parquet::Scanner>>> scanners;
+    int row_group;
 } PyParquetGenState;
 
 static PyObject *
@@ -38,13 +39,7 @@ pyrquetgen_new(PyTypeObject *type, PyObject *args, PyObject *kwargs)
 
     std::unique_ptr<arrow::io::BufferReader> ptr(new arrow::io::BufferReader(reinterpret_cast<uint8_t*>(mmap_ptr), size_));
     ppstate->file = parquet::ParquetFileReader::Open(std::move(ptr));
-    auto group_reader = ppstate->file->RowGroup(0);
-
-    for (int i = 0; i < ppstate->file->metadata()->num_columns(); i++) {
-        std::shared_ptr<parquet::ColumnReader> col_reader = group_reader->Column(i);
-        ppstate->scanners.push_back(std::make_tuple(ppstate->file->metadata()->schema()->Column(i)->path()->ToDotString(),
-                                                    parquet::Scanner::Make(col_reader)));
-    }
+    ppstate->row_group = 0;
     return (PyObject*)ppstate;
 }
 
@@ -57,25 +52,38 @@ pyrquetgen_dealloc(PyParquetGenState *ppstate)
 static PyObject *
 pyrquetgen_next(PyParquetGenState *ppstate)
 {
-    PyObject* row = PyDict_New();
-
-    bool hasRow = false;
-
-    for (auto t : ppstate->scanners) {
-        auto s = std::get<1>(t);
-        auto c = std::get<0>(t).c_str();
-        if (s->HasNext()) {
-            hasRow = true;
-            std::ostringstream stream;
-            s->PrintNext(stream, 0);
-            if (stream.str() == "NULL")
-                continue;
-            PyDict_SetItem(row, PyUnicode_FromString(c), PyUnicode_Decode(stream.str().c_str(), stream.str().size(), "utf-8", "replace"));
+    while (ppstate->row_group < ppstate->file->metadata()->num_row_groups()) {
+        if (ppstate->scanners.size() == 0) {
+            auto group_reader = ppstate->file->RowGroup(ppstate->row_group);
+            for (int i = 0; i < ppstate->file->metadata()->num_columns(); i++) {
+              std::shared_ptr<parquet::ColumnReader> col_reader = group_reader->Column(i);
+              ppstate->scanners.push_back(std::make_tuple(ppstate->file->metadata()->schema()->Column(i)->path()->ToDotString(),
+                                                          parquet::Scanner::Make(col_reader)));
+            }
         }
-    }
 
-    if (hasRow){
-        return row;
+        PyObject* row = PyDict_New();
+        bool hasRow = false;
+        for (auto t : ppstate->scanners) {
+            auto s = std::get<1>(t);
+            auto c = std::get<0>(t).c_str();
+            if (s->HasNext()) {
+                hasRow = true;
+                std::ostringstream stream;
+                s->PrintNext(stream, 0);
+                if (stream.str() == "NULL")
+                    continue;
+                PyDict_SetItem(row, PyUnicode_FromString(c), PyUnicode_Decode(stream.str().c_str(), stream.str().size(), "utf-8", "replace"));
+            }
+        }
+
+        if (hasRow) {
+            return row;
+        } else {
+            ppstate->scanners.clear();
+            ppstate->row_group++;
+            continue;
+        }
     }
 
     /* Raising of standard StopIteration exception with empty value. */
