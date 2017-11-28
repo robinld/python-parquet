@@ -6,7 +6,7 @@ deal with encoding issues
 #include <sys/mman.h>
 #include <arrow/io/memory.h>
 #include <parquet/api/reader.h>
-#include <parquet/column/scanner.h>
+#include <parquet/column_scanner.h>
 
 typedef struct {
     PyObject_HEAD
