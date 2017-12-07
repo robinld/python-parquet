@@ -5,8 +5,10 @@ deal with encoding issues
 #include "Python.h"
 #include <sys/mman.h>
 #include <arrow/io/memory.h>
+#define private public
 #include <parquet/api/reader.h>
 #include <parquet/column_scanner.h>
+#include <parquet/types.h>
 
 typedef struct {
     PyObject_HEAD
@@ -49,6 +51,58 @@ pyrquetgen_dealloc(PyParquetGenState *ppstate)
     Py_TYPE(ppstate)->tp_free(ppstate);
 }
 
+template <typename DType>
+class MyScanner : public parquet::TypedScanner<DType> {
+    public:
+      typedef typename DType::c_type T;
+
+      explicit MyScanner(std::shared_ptr<parquet::ColumnReader> reader,
+                            int64_t batch_size = 128,
+                            ::arrow::MemoryPool* pool = ::arrow::default_memory_pool())
+          : parquet::TypedScanner<DType>(reader, batch_size, pool) {}
+
+      void PrintNext(std::ostream& out, int width) override {
+        T val;
+        bool is_null = false;
+        char buffer[1 << 15];
+
+        if (!this->NextValue(&val, &is_null)) {
+          throw parquet::ParquetException("No more values buffered");
+        }
+
+        if (is_null)
+          return;
+        this->FormatValue(&val, buffer, sizeof(buffer), width);
+        out << buffer;
+      }
+};
+
+std::shared_ptr<parquet::Scanner>
+my_scanner_make(std::shared_ptr<parquet::ColumnReader> col_reader) {
+  switch (col_reader->type()) {
+    case parquet::Type::BOOLEAN:
+      return std::make_shared<MyScanner<parquet::BooleanType>>(col_reader);
+    case parquet::Type::INT32:
+      return std::make_shared<MyScanner<parquet::Int32Type>>(col_reader);
+    case parquet::Type::INT64:
+      return std::make_shared<MyScanner<parquet::Int64Type>>(col_reader);
+    case parquet::Type::INT96:
+      return std::make_shared<MyScanner<parquet::Int96Type>>(col_reader);
+    case parquet::Type::FLOAT:
+      return std::make_shared<MyScanner<parquet::FloatType>>(col_reader);
+    case parquet::Type::DOUBLE:
+      return std::make_shared<MyScanner<parquet::DoubleType>>(col_reader);
+    case parquet::Type::BYTE_ARRAY:
+      return std::make_shared<MyScanner<parquet::ByteArrayType>>(col_reader);
+    case parquet::Type::FIXED_LEN_BYTE_ARRAY:
+      return std::make_shared<MyScanner<parquet::FLBAType>>(col_reader);
+    default:
+      parquet::ParquetException::NYI("type reader not implemented");
+  // Unreachable code, but suppress compiler warning
+  return std::shared_ptr<parquet::Scanner>(nullptr);
+  }
+}
+
 static PyObject *
 pyrquetgen_next(PyParquetGenState *ppstate)
 {
@@ -58,7 +112,7 @@ pyrquetgen_next(PyParquetGenState *ppstate)
             for (int i = 0; i < ppstate->file->metadata()->num_columns(); i++) {
               std::shared_ptr<parquet::ColumnReader> col_reader = group_reader->Column(i);
               ppstate->scanners.push_back(std::make_tuple(ppstate->file->metadata()->schema()->Column(i)->path()->ToDotString(),
-                                                          parquet::Scanner::Make(col_reader)));
+                                                          my_scanner_make(col_reader)));
             }
         }
 
@@ -71,7 +125,7 @@ pyrquetgen_next(PyParquetGenState *ppstate)
                 hasRow = true;
                 std::ostringstream stream;
                 s->PrintNext(stream, 0);
-                if (stream.str() == "NULL")
+                if (stream.rdbuf()->in_avail() == 0)
                     continue;
                 PyDict_SetItem(row, PyUnicode_FromString(c), PyUnicode_Decode(stream.str().c_str(), stream.str().size(), "utf-8", "replace"));
             }
